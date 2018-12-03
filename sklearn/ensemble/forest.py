@@ -50,7 +50,6 @@ from scipy.sparse import issparse
 from scipy.sparse import hstack as sparse_hstack
 
 from ..base import ClassifierMixin, RegressorMixin
-from ..utils._joblib import Parallel, delayed
 from ..externals import six
 from ..metrics import r2_score
 from ..preprocessing import OneHotEncoder
@@ -60,7 +59,6 @@ from ..tree._tree import DTYPE, DOUBLE
 from ..utils import check_random_state, check_array, compute_sample_weight
 from ..exceptions import DataConversionWarning, NotFittedError
 from .base import BaseEnsemble, _partition_estimators
-from ..utils.fixes import parallel_helper, _joblib_parallel_args
 from ..utils.multiclass import check_classification_targets
 from ..utils.validation import check_is_fitted
 
@@ -172,11 +170,8 @@ class BaseForest(six.with_metaclass(ABCMeta, BaseEnsemble)):
             return the index of the leaf x ends up in.
         """
         X = self._validate_X_predict(X)
-        results = Parallel(n_jobs=self.n_jobs, verbose=self.verbose,
-                           **_joblib_parallel_args(prefer="threads"))(
-            delayed(parallel_helper)(tree, 'apply', X, check_input=False)
-            for tree in self.estimators_)
-
+        assert self.n_jobs == 1, 'n_jobs != 1 not supported'
+        results = [tree.apply(X, check_input=False) for tree in self.estimators_]
         return np.array(results).T
 
     def decision_path(self, X):
@@ -203,12 +198,8 @@ class BaseForest(six.with_metaclass(ABCMeta, BaseEnsemble)):
 
         """
         X = self._validate_X_predict(X)
-        indicators = Parallel(n_jobs=self.n_jobs, verbose=self.verbose,
-                              **_joblib_parallel_args(prefer='threads'))(
-            delayed(parallel_helper)(tree, 'decision_path', X,
-                                     check_input=False)
-            for tree in self.estimators_)
-
+        assert self.n_jobs == 1, 'n_jobs != 1 not supported'
+        indicators = [tree.decision_path(X, check_input=False) for tree in self.estimators_]
         n_nodes = [0]
         n_nodes.extend([i.shape[1] for i in indicators])
         n_nodes_ptr = np.array(n_nodes).cumsum()
@@ -325,12 +316,14 @@ class BaseForest(six.with_metaclass(ABCMeta, BaseEnsemble)):
             # that case. However, for joblib 0.12+ we respect any
             # parallel_backend contexts set at a higher level,
             # since correctness does not rely on using threads.
-            trees = Parallel(n_jobs=self.n_jobs, verbose=self.verbose,
-                             **_joblib_parallel_args(prefer='threads'))(
-                delayed(_parallel_build_trees)(
-                    t, self, X, y, sample_weight, i, len(trees),
-                    verbose=self.verbose, class_weight=self.class_weight)
-                for i, t in enumerate(trees))
+            assert self.n_jobs == 1, 'n_jobs != 1 not supported'
+            trees = [
+              _parallel_build_trees(
+                t, self, X, y, sample_weight, i, len(trees),
+                verbose=self.verbose, class_weight=self.class_weight
+              )
+              for i, t in enumerate(trees)
+            ]
 
             # Collect newly grown trees
             self.estimators_.extend(trees)
@@ -372,11 +365,8 @@ class BaseForest(six.with_metaclass(ABCMeta, BaseEnsemble)):
         """
         check_is_fitted(self, 'estimators_')
 
-        all_importances = Parallel(n_jobs=self.n_jobs,
-                                   **_joblib_parallel_args(prefer='threads'))(
-            delayed(getattr)(tree, 'feature_importances_')
-            for tree in self.estimators_)
-
+        assert self.n_jobs == 1, 'n_jobs != 1 not supported'
+        all_importances = [tree.feature_importances_ for tree in self.estimators_]
         return sum(all_importances) / len(self.estimators_)
 
 
@@ -589,11 +579,9 @@ class ForestClassifier(six.with_metaclass(ABCMeta, BaseForest,
         all_proba = [np.zeros((X.shape[0], j), dtype=np.float64)
                      for j in np.atleast_1d(self.n_classes_)]
         lock = threading.Lock()
-        Parallel(n_jobs=n_jobs, verbose=self.verbose,
-                 **_joblib_parallel_args(require="sharedmem"))(
-            delayed(_accumulate_prediction)(e.predict_proba, X, all_proba,
-                                            lock)
-            for e in self.estimators_)
+        assert self.n_jobs == 1, 'n_jobs != 1 not supported'
+        for e in self.estimators_:
+          _accumulate_prediction(e.predict_props, X, all_proba, lock)
 
         for proba in all_proba:
             proba /= len(self.estimators_)
@@ -698,10 +686,9 @@ class ForestRegressor(six.with_metaclass(ABCMeta, BaseForest, RegressorMixin)):
 
         # Parallel loop
         lock = threading.Lock()
-        Parallel(n_jobs=n_jobs, verbose=self.verbose,
-                 **_joblib_parallel_args(require="sharedmem"))(
-            delayed(_accumulate_prediction)(e.predict, X, [y_hat], lock)
-            for e in self.estimators_)
+        assert self.n_jobs == 1, 'n_jobs != 1 not supported'
+        for e in self.estimators_:
+          _accumulate_prediction(e.predict, X, [y_hat], lock)
 
         y_hat /= len(self.estimators_)
 
@@ -1235,7 +1222,7 @@ class RandomForestRegressor(ForestRegressor):
     search of the best split. To obtain a deterministic behaviour during
     fitting, ``random_state`` has to be fixed.
 
-    The default value ``max_features="auto"`` uses ``n_features`` 
+    The default value ``max_features="auto"`` uses ``n_features``
     rather than ``n_features / 3``. The latter was originally suggested in
     [1], whereas the former was more recently justified empirically in [2].
 
@@ -1244,7 +1231,7 @@ class RandomForestRegressor(ForestRegressor):
 
     .. [1] L. Breiman, "Random Forests", Machine Learning, 45(1), 5-32, 2001.
 
-    .. [2] P. Geurts, D. Ernst., and L. Wehenkel, "Extremely randomized 
+    .. [2] P. Geurts, D. Ernst., and L. Wehenkel, "Extremely randomized
            trees", Machine Learning, 63(1), 3-42, 2006.
 
     See also
@@ -1496,7 +1483,7 @@ class ExtraTreesClassifier(ForestClassifier):
     References
     ----------
 
-    .. [1] P. Geurts, D. Ernst., and L. Wehenkel, "Extremely randomized 
+    .. [1] P. Geurts, D. Ernst., and L. Wehenkel, "Extremely randomized
            trees", Machine Learning, 63(1), 3-42, 2006.
 
     See also
